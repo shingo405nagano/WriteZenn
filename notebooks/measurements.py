@@ -1,3 +1,4 @@
+import copy
 import os
 import random
 import shutil
@@ -58,7 +59,6 @@ def directory_size(dir_name: str) -> float: # MB
     size = sum([os.path.getsize(file) for file in glob(os.path.join(dir_name, '*'))])
     return round(size / 1048576, 2)
     
-    
 def delete_contents(folder_path) -> None:
     """フォルダ内のデータを全て削除する"""
     for filename in os.listdir(folder_path):
@@ -110,8 +110,11 @@ def read_file_by_geopandas(
 ##################################### QGIS #####################################
 @stop_watch
 def read_file_by_qgis(
-    file_path: str
+    file_path: str,
+    driver: str,
 ) -> Dict[str, Any]: # {'func_result': QgsVectorLayer, 'elapsed_time': float}
+    if driver == 'GPKG':
+        file_path += '|layername=test'
     lyr = QgsVectorLayer(file_path, "Read File", "ogr")
     return lyr
     
@@ -155,6 +158,9 @@ def write_file_by_qgis(
 ) -> Dict[str, Any]: # {'func_result': None, 'elapsed_time': float}
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = driver
+    if driver == 'GPKG':
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+        options.layerName = 'test2'
     error = (
         QgsVectorFileWriter
             .writeAsVectorFormatV2(
@@ -164,7 +170,6 @@ def write_file_by_qgis(
                 options
         )
     )
-    assert error[1] != ''
     return None
 
 
@@ -174,32 +179,32 @@ def write_file_by_qgis(
 
 ################################################################################
 ##################################### Main #####################################
-loop = 1
-dir_name = r"C:\Users\makis\Downloads\Mersurements"
+loop = 10
+dir_name = r"C:\Users\chousa08\Downloads\mearsurements"
 file = "OUTPUT."
 measurements = {
     'Write-GeoPandas': [],
     'Read-GeoPandas': [],
     'Write-QGIS': [],
-    'Renderer-QGIS': [],
     'Read-QGIS': [],
+    'Renderer-QGIS': [],
     'FileSize': None
 }
 contents = {
     'GeoJSON': {
-        'result': measurements,
+        'result': copy.deepcopy(measurements),
         'fmt': '.geojson'
     },
     'KML': {
-        'result': measurements,
+        'result': copy.deepcopy(measurements),
         'fmt': '.kml'
     },
     'Esri Shapefile': {
-        'result': measurements,
+        'result': copy.deepcopy(measurements),
         'fmt': '.shp'
     },
     'FlatGeobuf': {
-        'result': measurements,
+        'result': copy.deepcopy(measurements),
         'fmt': '.fgb'
     },
     'Parquet': {
@@ -207,31 +212,37 @@ contents = {
         'fmt': '.parquet'
     },
     'GPKG': {
-        'result': measurements,
+        'result': copy.deepcopy(measurements),
         'fmt': '.gpkg'
     },
 }
 
-gdf = dummy_data()
+gdf = dummy_data(size=100_000)
 
 for driver, _item in contents.items():
     fmt = _item.get('fmt')
     for i in range(loop):
-        file_path = os.path.join(dir_name, file.replace('.', f'{i}{fmt}'))
+        new_dir_name = os.path.join(dir_name, f'_{driver}_{i}')
+        os.mkdir(new_dir_name)
+        file_path = os.path.join(new_dir_name, file.replace('.', f'{i}{fmt}'))
         w_time_gpd = write_file_by_geopandas(gdf, file_path, driver).get('elapsed_time')
         r_time_gpd = read_file_by_geopandas(file_path, driver).get('elapsed_time')
-        if i == 0:
-            file_size = directory_size(dir_name)
-        res = read_file_by_qgis(file_path)
+        res = read_file_by_qgis(file_path, driver)
         lyr = res.get('func_result')
         r_time_qgis = res.get('elapsed_time')
         rendr_time_qgis = measure_rendering_time(lyr).get('elapsed_time')
-        w_time_qgis = write_file_by_qgis(lyr, file_path.replace('.', f'_{i}.'), driver).get('elapsed_time')
+        w_time_qgis = write_file_by_qgis(lyr, file_path, driver).get('elapsed_time')
         QgsProject.instance().removeMapLayer(lyr.id())
         contents[driver]['result']['Write-GeoPandas'].append(w_time_gpd)
         contents[driver]['result']['Read-GeoPandas'].append(r_time_gpd)
         contents[driver]['result']['Write-QGIS'].append(w_time_qgis)
         contents[driver]['result']['Renderer-QGIS'].append(rendr_time_qgis)
         contents[driver]['result']['Read-QGIS'].append(r_time_qgis)
+        file_size = directory_size(new_dir_name)
+        if driver == 'GPKG':
+            file_size = file_size / 2
         contents[driver]['result']['FileSize'] = file_size
-    break
+    print('End: ', driver)
+
+
+# delete_contents(dir_name)
