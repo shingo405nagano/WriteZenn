@@ -1,7 +1,8 @@
 try:
     import duckdb
 except ImportError:
-    import sys
+    import subprocess
+    subprocess.run('pip install duckdb', shell=True)
     import duckdb
 
 import copy
@@ -28,17 +29,19 @@ from qgis.core import QgsVectorFileWriter
 from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtCore import QEventLoop
 import shapely
+duckdb.sql(
+"""
+INSTALL spatial;
+LOAD spatial;
+""")
 
 
-def dummy_data(
-    size: int=50_000, 
-    lon: float=140.786233, 
-    lat: float=40.657981
-) -> gpd.GeoDataFrame:
-    """適当なGeoDataFrameの作成"""
-    # 座標の作成。今回は弘前城を中心にランダムな座標を生成する
+
+def dummy_data(size: int) -> List[Dict[str, Any]]:
+    lon, lat = 140.786233, 40.657981
     lon_list = lon + np.random.normal(0, 0.01, size)
     lat_list = lat + np.random.normal(0, 0.01, size)
+    
     # 適当なコードと年齢を生成
     alphabet = string.ascii_uppercase
     code_list = [
@@ -46,20 +49,24 @@ def dummy_data(
         for _ in range(size)
     ]
 
-    age_list = np.random.normal(45, 15, size).astype(int)
+    age_list = [int(v) for v in np.random.normal(45, 15, size)]
 
-    gdf = gpd.GeoDataFrame(
-        data={
-            'code': code_list,
-            'age': age_list
-        },
-        geometry=[
-            shapely.geometry.Point(lon, lat)
-            for lon, lat in zip(lon_list, lat_list)
-        ],
-        crs='EPSG:4326'
-    )
-    return gdf
+    # geometry を作成
+    geometries = [
+        shapely.geometry.Point(lon, lat).wkt
+        for lon, lat in zip(lon_list, lat_list)
+    ]
+
+    datasets = [
+        {
+            'code': code,
+            'age': age,
+            'geometry': geometry
+        }
+        for code, age, geometry in zip(code_list, age_list, geometries)
+    ]
+    return datasets
+
 
 
 def make_path(dirname: str, filename: str, driver: str, layer: str=None):
@@ -100,7 +107,7 @@ def delete_contents(folder_path) -> None:
 
 def make_geodataframe(datasets: List[Dict[str, Any]]) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(datasets)
-    gdf['geometry'] = gdf['geometry'].apply(lambda wkt: shapely.from_wkt(wkt))
+    gdf['geometry'] = gpd.GeoSeries.from_wkt(gdf['geometry'])
     gdf.set_geometry('geometry', inplace=True, crs='EPSG:4326')
     return gdf
 
@@ -148,6 +155,7 @@ def read_geopandas(
 
 ################################################################################
 ################################### pyorgio ####################################
+@stop_watch
 def write_pyogrio(
     datasets: List[Dict[str, Any]], 
     file_path: str, 
@@ -172,6 +180,7 @@ def write_pyogrio(
     return True
 
 
+@stop_watch
 def read_pyogrio(
     file_path: str, 
     driver: str,
@@ -191,52 +200,17 @@ def read_pyogrio(
 
 ################################################################################
 #################################### DuckDB ####################################
-def write_duckdb(
-    datasets: List[Dict[str, Any]], 
-    file_path: str, 
-    driver: str,
-    **kwargs
-) -> float: # 処理時間を返す
-    """DuckDB を使ってファイルを書き込む"""
-    proj4 = pyproj.CRS('EPSG:4326').to_proj4()
-    if driver == 'Parquet':
-        with_sentence = f"FORMAT 'parquet'"
-    elif driver == 'GPKG':
-        # GeoPackage の LAYER_NAME オプションが機能しないので、
-        with_sentence = (
-            "FORMAT GDAL, DRIVER 'GPKG', LAYER_CREATION_OPTIONS "
-            "'SRID=4326'"
-        )
-    elif (driver == 'Esri Shapefile') or (driver == 'FlatGeobuf'):
-        with_sentence = f"FORMAT GDAL, DRIVER '{driver}', SRS '{proj4}'"
-    else:
-        with_sentence = f"FORMAT GDAL, DRIVER '{driver}'"
-    
-    tbl = pd.DataFrame(datasets)
-    sql = \
-    f"""
-    COPY (
-        SELECT
-            * EXCLUDE geometry,
-            ST_GeomFromText(geometry) AS geom
-        FROM
-            tbl
-    ) TO '{file_path}' ({with_sentence});
-    """
-    duckdb.sql(sql)
-
-
+@stop_watch
 def read_duckdb(
     file_path: str,
     driver: str,
-    **kwargs
+    layer: Optional[str]=None
 ):
     """DuckDB を使ってファイルを読み込む"""
     if driver == 'Parquet':
         read_sentence = f"""read_parquet('{file_path}')"""
     elif driver == 'GPKG':
-        lyr = os.path.basename(file_path).split('.')[0]
-        read_sentence = f"""ST_read('{file_path}', LAYER='{lyr}')"""
+        read_sentence = f"""ST_read('{file_path}', LAYER='{layer}')"""
     else:
         read_sentence = f"""ST_read('{file_path}')"""
     template = \
@@ -271,17 +245,26 @@ def read_duckdb(
 ##################################### QGIS #####################################
 @stop_watch
 def read_file_by_qgis(
-    file_path: str
+    file_path: str,
+    driver: str,
+    layer: Optional[str]=None
 ) -> Dict[str, Any]: # {'func_result': QgsVectorLayer, 'elapsed_time': float}
+    if driver == 'GPKG':
+        file_path = f"{file_path}|layername={layer}"
     lyr = QgsVectorLayer(file_path, "Read File", "ogr")
+    assert lyr.isValid()
     return lyr
     
 
 def measure_rendering_time(
-    lyr: QgsVectorLayer
+    file_path: str,
+    driver: str,
+    layer: Optional[str]=None
 ) -> Dict[str, Any]: # {'LyrID': lyr.id(), 'elapsed_time': float}
     renderer = {'elapsed_time': None, 'LyrID': None}
     # レイヤーを作成し、マップキャンバスに追加
+    result = read_file_by_qgis(file_path, driver, layer)
+    lyr = result['func_result']
     renderer['LyrID'] = lyr.id()
     def wait_for_rendering():
         # 描画完了を待つための関数
@@ -326,28 +309,27 @@ def write_file_by_qgis(
         )
     )
     assert error[1] != ''
-    return None
+    return True
 
 
 ################################################################################
 ##################################### Main #####################################
-dirname = '..\\datasets\\test'
+dirname = '..\\datasets\\test_data'
 
 mearsurements = {
     'Write-GeoPandas': [],
     'Read-GeoPandas': [],
     'Write-Pyogrio': [],
     'Read-Pyogrio': [],
-    'Write-DuckDB': [],
     'Read-DuckDB': [],
     'Write-QGIS': [],
     'Read-QGIS': [],
     'Renderer-QGIS': [],
 }
 
-size = 10
+size = 5
 
-metadata = {
+pack = {
     'GeoJSON': {
         'FilePaths': [
             make_path(dirname, f'test_{i}.geojson', driver='GeoJSON') 
@@ -391,9 +373,39 @@ metadata = {
         'Result': copy.deepcopy(mearsurements)
     },
 }
-# write_geopandas(datasets, **metadata['GeoPackage']['FilePaths'][0])
-# read_geopandas(**metadata['GeoPackage']['FilePaths'][0])
-# write_pyogrio(datasets, **metadata['GeoParquet']['FilePaths'][0])
-# read_pyogrio(**metadata['GeoParquet']['FilePaths'][1])
-# write_duckdb(datasets, **metadata['GeoPackage']['FilePaths'][0])
-# read_duckdb(**metadata['GeoPackage']['FilePaths'][0])
+
+small_pack = copy.deepcopy(pack)
+datasets = dummy_data(size=5_000)
+for name, items in pack.items():
+    for file_data in items['FilePaths']:
+        # Measurement for GeoPandas.
+        result = write_geopandas(datasets, **file_data)
+        small_pack[name]['Result']['Write-GeoPandas'].append(result['elapsed_time'])
+        result = read_geopandas(**file_data)
+        small_pack[name]['Result']['Read-GeoPandas'].append(result['elapsed_time'])
+        
+        # Measurement for Pyogrio.
+        result = write_pyogrio(datasets, **file_data)
+        small_pack[name]['Result']['Write-Pyogrio'].append(result['elapsed_time'])
+        result = read_pyogrio(**file_data)
+        small_pack[name]['Result']['Read-Pyogrio'].append(result['elapsed_time'])
+        
+        # Measurement for DuckDB.
+        fmt = os.path.basename(file_data['file_path']).split('.')[1]
+        file_path = glob(os.path.join(dirname, f"*.{fmt}"))[0]
+        result = read_duckdb(**file_data)
+        small_pack[name]['Result']['Read-DuckDB'].append(result['elapsed_time'])
+
+        # Measurement for QGIS.
+        result = read_file_by_qgis(**file_data)
+        small_pack[name]['Result']['Read-QGIS'].append(result['elapsed_time'])
+        result['func_result'] = None
+        result = measure_rendering_time(**file_data)
+        small_pack[name]['Result']['Renderer-QGIS'].append(result['elapsed_time'])
+        
+
+
+
+    print(f'{name} is done.')
+from pprint import pprint
+pprint(small_pack, indent=2)
