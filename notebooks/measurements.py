@@ -415,10 +415,36 @@ for rows in rows_list:
             
         print(f'Finish {driver}.')
         
-    results[f"Processing time for {rows} rows"] = {driver: item['Result'] for driver, item in pack.items()}
+    results[f"Processing time for {rows} rows"] = \
+        {driver: item['Result'] for driver, item in pack.items()}
     del_dirs.append(dirname)
 
 
+################################################################################
+################################ Save Result ###################################
+def get_process_time(item):
+    process_times = {}
+    for driver, data in item.items():
+        box = {}
+        for search in ['Write', 'Read', 'Renderer']:
+            keys = [key for key in data.keys() if key.startswith(search)]
+            mu = np.array([data[key] for key in keys]).mean()
+            box[search] = float(mu)
+        process_times[driver] = box
+    return process_times
+
+
+measurement_result = {}
+for name, item in results.items():
+    measurement_result[name] = get_process_time(item)
+
+with open(os.path.join(base_dirname, 'measurement.json'), mode='w') as f:
+    json.dump(measurement_result , f, indent=4)
+
+
+
+################################################################################
+################################# Visualize ####################################
 colormap = {
     "GeoJSON": "#0000cd",
     "KML": "#006400",
@@ -427,6 +453,3 @@ colormap = {
     "GeoPackage": "#93b023",
     "GeoParquet": "#d3381c",
 }
-
-with open(os.path.join(base_dirname, 'measurement.json'), mode='w') as f:
-    json.dump(results, f, indent=4)
