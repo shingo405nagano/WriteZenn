@@ -1,24 +1,58 @@
+try:
+    import duckdb
+except ImportError:
+    import subprocess
+    subprocess.run('pip install duckdb', shell=True)
+    import duckdb
+
+import copy
+import json
 import os
 import random
 import shutil
 import string
+import shutil
 import time
-from typing import Any, Dict
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
 
 from glob import glob
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
-from qgis.core import QgsProject, QgsVectorLayer
+import pandas as pd
+import pyogrio
+import pyproj
+from qgis.core import QgsProject
+from qgis.core import QgsVectorLayer
+from qgis.core import QgsVectorFileWriter
+from qgis.PyQt.QtCore import QTimer
+from qgis.PyQt.QtCore import QEventLoop
 import shapely
+duckdb.sql(
+"""
+INSTALL spatial;
+LOAD spatial;
+""")
 
+def create_dir(dirname):
+    if os.path.isdir(dirname):
+        shutil.rmtree(dirname)
+    try:
+        os.mkdir(dirname)
+        if os.path.isdir(dirname):
+            print(f'Created directory for {dirname}')
+    except:
+        pass
+        
 
-def dummy_data(size: int=50_000, lon: float=140.786233, lat: float=40.657981) -> gpd.GeoDataFrame:
-    """適当なGeoDataFrameの作成"""
-    # 座標の作成。今回は弘前城を中心にランダムな座標を生成する
+def dummy_data(size: int) -> List[Dict[str, Any]]:
+    lon, lat = 140.786233, 40.657981
     lon_list = lon + np.random.normal(0, 0.01, size)
     lat_list = lat + np.random.normal(0, 0.01, size)
-
+    
     # 適当なコードと年齢を生成
     alphabet = string.ascii_uppercase
     code_list = [
@@ -26,21 +60,31 @@ def dummy_data(size: int=50_000, lon: float=140.786233, lat: float=40.657981) ->
         for _ in range(size)
     ]
 
-    age_list = np.random.normal(45, 15, size).astype(int)
+    age_list = [int(v) for v in np.random.normal(45, 15, size)]
 
-    gdf = gpd.GeoDataFrame(
-        data={
-            'code': code_list,
-            'age': age_list
-        },
-        geometry=[
-            shapely.geometry.Point(lon, lat)
-            for lon, lat in zip(lon_list, lat_list)
-        ],
-        crs='EPSG:4326'
-    )
-    return gdf
+    # geometry を作成
+    geometries = [
+        shapely.geometry.Point(lon, lat).wkt
+        for lon, lat in zip(lon_list, lat_list)
+    ]
 
+    datasets = [
+        {
+            'code': code,
+            'age': age,
+            'geometry': geometry
+        }
+        for code, age, geometry in zip(code_list, age_list, geometries)
+    ]
+    return datasets
+
+
+
+def make_path(dirname: str, filename: str, driver: str, layer: str=None):
+    file_path = os.path.join(dirname, filename)
+    if layer is None:
+        return {'file_path': file_path, 'driver': driver}
+    return {'file_path': file_path, 'layer': layer, 'driver': driver}
 
 
 def stop_watch(func):
@@ -53,74 +97,164 @@ def stop_watch(func):
     return wrapper
     
 
-def directory_size(dir_name: str) -> float: # MB
-    """フォルダ内のファイルサイズを取得。ShapeFileがあるので、フォルダ全体にしている"""
-    size = sum([os.path.getsize(file) for file in glob(os.path.join(dir_name, '*'))])
-    return round(size / 1048576, 2)
-    
-    
-def delete_contents(folder_path) -> None:
-    """フォルダ内のデータを全て削除する"""
-    for filename in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, filename)
-        try:
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.unlink(file_path)
-            elif os.path.isdir(file_path):
-                shutil.rmtree(file_path)
-        except Exception as e:
-            print(f'Failed to delete {file_path}. Reason: {e}')
+def make_geodataframe(datasets: List[Dict[str, Any]]) -> gpd.GeoDataFrame:
+    gdf = gpd.GeoDataFrame(datasets)
+    gdf['geometry'] = gpd.GeoSeries.from_wkt(gdf['geometry'])
+    gdf.set_geometry('geometry', inplace=True, crs='EPSG:4326')
+    return gdf
 
 
 ################################################################################
 ################################### GeoPandas ##################################
 @stop_watch
-def write_file_by_geopandas(
-    gdf: gpd.GeoDataFrame, 
+def write_geopandas(
+    datasets: List[Dict[str, Any]], 
     file_path: str, 
-    driver: str
-) -> Dict[str, Any]: # {'func_result': None, 'elapsed_time': float}
-    if driver == 'GPKG':
-        gdf.to_file(file_path, driver=driver, layer='test')
-    elif driver == 'Parquet':
-        gdf.to_parquet(file_path)
+    driver: str,
+    layer: Optional[str]=None,
+):
+    """
+    GeoPandas を使ってファイルを書き込む
+    """
+    gdf = make_geodataframe(datasets)
+    if driver == 'Parquet':
+        gdf.to_parquet(file_path, index=False)
+    elif driver == 'GPKG':
+        gdf.to_file(file_path, driver=driver, layer=layer)
     else:
-        # KMLは保存の際にする設定が面倒なので、このまま出力
         gdf.to_file(file_path, driver=driver)
+    assert os.path.exists(file_path)
+    return True
 
 
 @stop_watch
-def read_file_by_geopandas(
+def read_geopandas(
     file_path: str, 
-    driver: str
-) -> Dict[str, Any]: # {'func_result': gpd.GeoDataFrame, 'elapsed_time': float}
+    driver: str, 
+    layer: Optional[str]=None,
+):
+    """GeoPandas を使ってファイルを読み込む"""
     if driver == 'GPKG':
-        return gpd.read_file(file_path, layer='test')
+        _ = gpd.read_file(file_path, layer=layer)
     elif driver == 'Parquet':
-        return gpd.read_parquet(file_path)
+        _ = gpd.read_parquet(file_path)
     else:
-        return gpd.read_file(file_path)
+        _ = gpd.read_file(file_path)
+    assert isinstance(_, gpd.GeoDataFrame)
+    assert 0 < len(_)
+    return True
 
 
-################################### GeoPandas ##################################
 ################################################################################
+################################### pyorgio ####################################
+@stop_watch
+def write_pyogrio(
+    datasets: List[Dict[str, Any]], 
+    file_path: str, 
+    driver: str,
+    layer: Optional[str]=None,
+    **kwargs
+):
+    """Pyogrio を使ってファイルを書き込む"""
+    if layer is None:
+        kwargs = {'driver': driver}
+    else:
+        kwargs = {'driver': driver, 'layer': layer}
+    
+    pyogrio.write_dataframe(
+        make_geodataframe(datasets),
+        file_path,
+        **kwargs
+    )
+    assert os.path.exists(file_path)
+    return True
+
+
+@stop_watch
+def read_pyogrio(
+    file_path: str,
+    layer: Optional[str]=None,
+    **kwargs
+):
+    """Pyogrio を使ってファイルを読み込む"""
+    if layer is None:
+        _ = pyogrio.read_dataframe(file_path)
+    else:
+        _ = pyogrio.read_dataframe(file_path, layer=layer)
+    assert isinstance(_, gpd.GeoDataFrame)
+    assert 0 < len(_)
+    return True
+
+
+################################################################################
+#################################### DuckDB ####################################
+@stop_watch
+def read_duckdb(
+    file_path: str,
+    driver: str,
+    layer: Optional[str]=None
+):
+    """DuckDB を使ってファイルを読み込む"""
+    if driver == 'Parquet':
+        read_sentence = f"""read_parquet('{file_path}')"""
+    elif driver == 'GPKG':
+        read_sentence = f"""ST_read('{file_path}', LAYER='{layer}')"""
+    else:
+        read_sentence = f"""ST_read('{file_path}')"""
+    
+    template = \
+    """
+    CREATE OR REPLACE TABLE {name} AS
+    SELECT
+        * EXCLUDE {geom_column},
+        ST_AsText({geom_column}) AS geometry
+    FROM
+        {read_sentence};
+
+    SHOW TABLES;
+    """
+    name = os.path.basename(file_path).split('.')[0]
+    try:
+        geom_column = 'geom'
+        sql = template.format(name=name, 
+                              geom_column=geom_column, 
+                              read_sentence=read_sentence)
+        tbls = duckdb.sql(sql).to_df()['name'].to_list()
+    except:
+        geom_column = 'geometry'
+        sql = template.format(name=name,
+                              geom_column=geom_column, 
+                              read_sentence=read_sentence)
+        tbls = duckdb.sql(sql).to_df()['name'].to_list()
+    duckdb.sql(f"DROP TABLE {name};")
+    assert name in tbls
+    return True
 
 
 ################################################################################
 ##################################### QGIS #####################################
 @stop_watch
 def read_file_by_qgis(
-    file_path: str
+    file_path: str,
+    driver: str,
+    layer: Optional[str]=None
 ) -> Dict[str, Any]: # {'func_result': QgsVectorLayer, 'elapsed_time': float}
+    if driver == 'GPKG':
+        file_path = f"{file_path}|layername={layer}"
     lyr = QgsVectorLayer(file_path, "Read File", "ogr")
+    assert lyr.isValid()
     return lyr
     
 
 def measure_rendering_time(
-    lyr: QgsVectorLayer
+    file_path: str,
+    driver: str,
+    layer: Optional[str]=None
 ) -> Dict[str, Any]: # {'LyrID': lyr.id(), 'elapsed_time': float}
     renderer = {'elapsed_time': None, 'LyrID': None}
     # レイヤーを作成し、マップキャンバスに追加
+    result = read_file_by_qgis(file_path, driver, layer)
+    lyr = result['func_result']
     renderer['LyrID'] = lyr.id()
     def wait_for_rendering():
         # 描画完了を待つための関数
@@ -146,15 +280,18 @@ def measure_rendering_time(
     # 経過時間を返す
     return renderer # {'elapsed_time': sec, 'LyrID': lyr.id()}
 
-    
 @stop_watch
 def write_file_by_qgis(
     lyr: QgsVectorLayer, 
     file_path: str, 
-    driver: str
+    driver: str,
+    layer: Optional[str]=None
 ) -> Dict[str, Any]: # {'func_result': None, 'elapsed_time': float}
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = driver
+    if driver == 'GPKG':
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+        options.layerName = layer
     error = (
         QgsVectorFileWriter
             .writeAsVectorFormatV2(
@@ -164,74 +301,132 @@ def write_file_by_qgis(
                 options
         )
     )
-    assert error[1] != ''
-    return None
+    lyr = None
+    
 
 
-##################################### QGIS #####################################
+
+def template(size: int, dirname: str) -> Dict[str, Any]:
+    mearsurements = {
+        'Write-GeoPandas': [],
+        'Read-GeoPandas': [],
+        'Write-Pyogrio': [],
+        'Read-Pyogrio': [],
+        'Write-QGIS': [],
+        'Read-DuckDB': [],
+        'Renderer-QGIS': [],
+        'Read-QGIS': [],
+    }
+    return {
+        'GeoJSON': {
+            'FilePaths': [
+                make_path(dirname, f'test_{i}.geojson', driver='GeoJSON') 
+                for i in range(size)
+            ],
+            'Result': copy.deepcopy(mearsurements)
+        },
+        'KML': {
+            'FilePaths': [
+                make_path(dirname, f'test_{i}.kml', driver='KML') 
+                for i in range(size)
+            ],
+            'Result': copy.deepcopy(mearsurements)
+        },
+        'Esri Shapefile': {
+            'FilePaths': [
+                make_path(dirname, f'test_{i}.shp', driver='Esri Shapefile') 
+                for i in range(size)
+            ],
+            'Result': copy.deepcopy(mearsurements)
+        },
+        'FlatGeobuf': {
+            'FilePaths': [
+                make_path(dirname, f'test_{i}.fgb', driver='FlatGeobuf') 
+                for i in range(size)
+            ],
+            'Result': copy.deepcopy(mearsurements)
+        },
+        'GeoPackage': {
+            'FilePaths': [
+                make_path(dirname, 'test.gpkg', driver='GPKG', layer=f'lyr_{i}') 
+                for i in range(size)
+            ],
+            'Result': copy.deepcopy(mearsurements)
+        },
+        'GeoParquet': {
+            'FilePaths': [
+                make_path(dirname, f'test_{i}.parquet', driver='Parquet') 
+                for i in range(size)
+            ],
+            'Result': copy.deepcopy(mearsurements)
+        },
+    }
+    
+
+    
 ################################################################################
+######################## Measurement of time required ##########################
+del_dirs = []
+results = {}
+base_dirname = r"D:\Repositories\WriteZenn\datasets\test_data"
+size = 1
+rows_list = [1000, 5_000] + list(range(10_000, 50_000, 10_000))
 
 
-################################################################################
-##################################### Main #####################################
-loop = 1
-dir_name = r"C:\Users\makis\Downloads\Mersurements"
-file = "OUTPUT."
-measurements = {
-    'Write-GeoPandas': [],
-    'Read-GeoPandas': [],
-    'Write-QGIS': [],
-    'Renderer-QGIS': [],
-    'Read-QGIS': [],
-    'FileSize': None
+for rows in rows_list:
+    print(f'********** Start {rows} **********')
+    dirname = os.path.join(base_dirname, f'TEST_{rows}_ROWS')
+    create_dir(dirname)
+    pack = template(size, dirname)
+    datasets = dummy_data(size=rows)
+    for driver, item in pack.items():
+        for i, file_data in enumerate(item['FilePaths']):
+            # Measurement for GeoPandas.
+            result = write_geopandas(datasets, **file_data)
+            pack[driver]['Result']['Write-GeoPandas'].append(result['elapsed_time'])
+            result = read_geopandas(**file_data)
+            pack[driver]['Result']['Read-GeoPandas'].append(result['elapsed_time'])
+            
+            # Measurement for Pyogrio.
+            result = write_pyogrio(datasets, **file_data)
+            pack[driver]['Result']['Write-Pyogrio'].append(result['elapsed_time'])
+            result = read_pyogrio(**file_data)
+            pack[driver]['Result']['Read-Pyogrio'].append(result['elapsed_time'])
+            
+            # Measurement for DuckDB.
+            fmt = os.path.basename(file_data['file_path']).split('.')[1]
+            file_path = glob(os.path.join(dirname, f"*.{fmt}"))[0]
+            result = read_duckdb(**file_data)
+            pack[driver]['Result']['Read-DuckDB'].append(result['elapsed_time'])
+
+            # Measurement for QGIS.
+            result = read_file_by_qgis(**file_data)
+            pack[driver]['Result']['Read-QGIS'].append(result['elapsed_time'])
+            lyr = result['func_result']
+            result = measure_rendering_time(**file_data)
+            pack[driver]['Result']['Renderer-QGIS'].append(result['elapsed_time'])
+            QgsProject.instance().removeMapLayer(result['LyrID'])
+            if file_data['driver'] == 'GPKG':
+                file_data['layer'] += f'_{i}'
+            
+            result = write_file_by_qgis(lyr, **file_data)
+            pack[driver]['Result']['Write-QGIS'].append(result['elapsed_time'])
+            lyr = None
+            
+        print(f'Finish {driver}.')
+        
+    results[f"Processing time for {rows} rows"] = {driver: item['Result'] for driver, item in pack.items()}
+    del_dirs.append(dirname)
+
+
+colormap = {
+    "GeoJSON": "#0000cd",
+    "KML": "#006400",
+    "Esri Shapefile": "#ff8c00",
+    "FlatGeobuf": "#4d4398",
+    "GeoPackage": "#93b023",
+    "GeoParquet": "#d3381c",
 }
-contents = {
-    'GeoJSON': {
-        'result': measurements,
-        'fmt': '.geojson'
-    },
-    'KML': {
-        'result': measurements,
-        'fmt': '.kml'
-    },
-    'Esri Shapefile': {
-        'result': measurements,
-        'fmt': '.shp'
-    },
-    'FlatGeobuf': {
-        'result': measurements,
-        'fmt': '.fgb'
-    },
-    'Parquet': {
-        'result': measurements,
-        'fmt': '.parquet'
-    },
-    'GPKG': {
-        'result': measurements,
-        'fmt': '.gpkg'
-    },
-}
 
-gdf = dummy_data()
-
-for driver, _item in contents.items():
-    fmt = _item.get('fmt')
-    for i in range(loop):
-        file_path = os.path.join(dir_name, file.replace('.', f'{i}{fmt}'))
-        w_time_gpd = write_file_by_geopandas(gdf, file_path, driver).get('elapsed_time')
-        r_time_gpd = read_file_by_geopandas(file_path, driver).get('elapsed_time')
-        if i == 0:
-            file_size = directory_size(dir_name)
-        res = read_file_by_qgis(file_path)
-        lyr = res.get('func_result')
-        r_time_qgis = res.get('elapsed_time')
-        rendr_time_qgis = measure_rendering_time(lyr).get('elapsed_time')
-        w_time_qgis = write_file_by_qgis(lyr, file_path.replace('.', f'_{i}.'), driver).get('elapsed_time')
-        QgsProject.instance().removeMapLayer(lyr.id())
-        contents[driver]['result']['Write-GeoPandas'].append(w_time_gpd)
-        contents[driver]['result']['Read-GeoPandas'].append(r_time_gpd)
-        contents[driver]['result']['Write-QGIS'].append(w_time_qgis)
-        contents[driver]['result']['Renderer-QGIS'].append(rendr_time_qgis)
-        contents[driver]['result']['Read-QGIS'].append(r_time_qgis)
-        contents[driver]['result']['FileSize'] = file_size
-    break
+with open(os.path.join(base_dirname, 'measurement.json'), mode='w') as f:
+    json.dump(results, f, indent=4)
