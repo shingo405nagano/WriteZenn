@@ -6,7 +6,6 @@ except ImportError:
     import duckdb
 
 import copy
-import json
 import os
 import random
 import shutil
@@ -37,16 +36,7 @@ INSTALL spatial;
 LOAD spatial;
 """)
 
-def create_dir(dirname):
-    if os.path.isdir(dirname):
-        shutil.rmtree(dirname)
-    try:
-        os.mkdir(dirname)
-        if os.path.isdir(dirname):
-            print(f'Created directory for {dirname}')
-    except:
-        pass
-        
+
 
 def dummy_data(size: int) -> List[Dict[str, Any]]:
     lon, lat = 140.786233, 40.657981
@@ -96,6 +86,25 @@ def stop_watch(func):
         return {"func_result": result, "elapsed_time": elapsed_time}
     return wrapper
     
+
+def directory_size(dir_name: str) -> float: # MB
+    """フォルダ内のファイルサイズを取得。ShapeFileがあるので、フォルダ全体にしている"""
+    size = sum([os.path.getsize(file) for file in glob(os.path.join(dir_name, '*'))])
+    return round(size / 1048576, 2)
+    
+    
+def delete_contents(folder_path) -> None:
+    """フォルダ内のデータを全て削除する"""
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print(f'Failed to delete {file_path}. Reason: {e}')
+
 
 def make_geodataframe(datasets: List[Dict[str, Any]]) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(datasets)
@@ -156,6 +165,8 @@ def write_pyogrio(
     **kwargs
 ):
     """Pyogrio を使ってファイルを書き込む"""
+    if driver == 'Parquet':
+        return np.nan
     if layer is None:
         kwargs = {'driver': driver}
     else:
@@ -172,11 +183,13 @@ def write_pyogrio(
 
 @stop_watch
 def read_pyogrio(
-    file_path: str,
+    file_path: str, 
+    driver: str,
     layer: Optional[str]=None,
-    **kwargs
 ):
     """Pyogrio を使ってファイルを読み込む"""
+    if driver == 'Parquet':
+        return np.nan
     if layer is None:
         _ = pyogrio.read_dataframe(file_path)
     else:
@@ -201,33 +214,31 @@ def read_duckdb(
         read_sentence = f"""ST_read('{file_path}', LAYER='{layer}')"""
     else:
         read_sentence = f"""ST_read('{file_path}')"""
-    
     template = \
     """
-    CREATE OR REPLACE TABLE {name} AS
     SELECT
         * EXCLUDE {geom_column},
         ST_AsText({geom_column}) AS geometry
     FROM
-        {read_sentence};
-
-    SHOW TABLES;
+        {read_sentence}
+    ;
     """
-    name = os.path.basename(file_path).split('.')[0]
     try:
         geom_column = 'geom'
-        sql = template.format(name=name, 
-                              geom_column=geom_column, 
-                              read_sentence=read_sentence)
-        tbls = duckdb.sql(sql).to_df()['name'].to_list()
+        sql = template.format(geom_column=geom_column, read_sentence=read_sentence)
+        _df = duckdb.sql(sql).df()
     except:
         geom_column = 'geometry'
-        sql = template.format(name=name,
-                              geom_column=geom_column, 
-                              read_sentence=read_sentence)
-        tbls = duckdb.sql(sql).to_df()['name'].to_list()
-    duckdb.sql(f"DROP TABLE {name};")
-    assert name in tbls
+        sql = template.format(geom_column=geom_column, read_sentence=read_sentence)
+        _df = duckdb.sql(sql).df()
+    assert isinstance(_df, pd.DataFrame)
+    assert 0 < len(_df)
+    gdf = gpd.GeoDataFrame(
+        _df.drop(columns=['geometry']),
+        geometry=_df['geometry'].apply(shapely.from_wkt),
+        crs='EPSG:4326'
+    )
+    assert isinstance(gdf, gpd.GeoDataFrame)
     return True
 
 
@@ -301,132 +312,104 @@ def write_file_by_qgis(
                 options
         )
     )
-    lyr = None
-    
+    assert error[1] != ''
+    return True
 
 
-
-def template(size: int, dirname: str) -> Dict[str, Any]:
-    mearsurements = {
-        'Write-GeoPandas': [],
-        'Read-GeoPandas': [],
-        'Write-Pyogrio': [],
-        'Read-Pyogrio': [],
-        'Write-QGIS': [],
-        'Read-DuckDB': [],
-        'Renderer-QGIS': [],
-        'Read-QGIS': [],
-    }
-    return {
-        'GeoJSON': {
-            'FilePaths': [
-                make_path(dirname, f'test_{i}.geojson', driver='GeoJSON') 
-                for i in range(size)
-            ],
-            'Result': copy.deepcopy(mearsurements)
-        },
-        'KML': {
-            'FilePaths': [
-                make_path(dirname, f'test_{i}.kml', driver='KML') 
-                for i in range(size)
-            ],
-            'Result': copy.deepcopy(mearsurements)
-        },
-        'Esri Shapefile': {
-            'FilePaths': [
-                make_path(dirname, f'test_{i}.shp', driver='Esri Shapefile') 
-                for i in range(size)
-            ],
-            'Result': copy.deepcopy(mearsurements)
-        },
-        'FlatGeobuf': {
-            'FilePaths': [
-                make_path(dirname, f'test_{i}.fgb', driver='FlatGeobuf') 
-                for i in range(size)
-            ],
-            'Result': copy.deepcopy(mearsurements)
-        },
-        'GeoPackage': {
-            'FilePaths': [
-                make_path(dirname, 'test.gpkg', driver='GPKG', layer=f'lyr_{i}') 
-                for i in range(size)
-            ],
-            'Result': copy.deepcopy(mearsurements)
-        },
-        'GeoParquet': {
-            'FilePaths': [
-                make_path(dirname, f'test_{i}.parquet', driver='Parquet') 
-                for i in range(size)
-            ],
-            'Result': copy.deepcopy(mearsurements)
-        },
-    }
-    
-
-    
 ################################################################################
-######################## Measurement of time required ##########################
-del_dirs = []
-results = {}
-base_dirname = r"D:\Repositories\WriteZenn\datasets\test_data"
-size = 1
-rows_list = [1000, 5_000] + list(range(10_000, 50_000, 10_000))
+##################################### Main #####################################
+dirname = '..\\datasets\\test_data'
 
-
-for rows in rows_list:
-    print(f'********** Start {rows} **********')
-    dirname = os.path.join(base_dirname, f'TEST_{rows}_ROWS')
-    create_dir(dirname)
-    pack = template(size, dirname)
-    datasets = dummy_data(size=rows)
-    for driver, item in pack.items():
-        for i, file_data in enumerate(item['FilePaths']):
-            # Measurement for GeoPandas.
-            result = write_geopandas(datasets, **file_data)
-            pack[driver]['Result']['Write-GeoPandas'].append(result['elapsed_time'])
-            result = read_geopandas(**file_data)
-            pack[driver]['Result']['Read-GeoPandas'].append(result['elapsed_time'])
-            
-            # Measurement for Pyogrio.
-            result = write_pyogrio(datasets, **file_data)
-            pack[driver]['Result']['Write-Pyogrio'].append(result['elapsed_time'])
-            result = read_pyogrio(**file_data)
-            pack[driver]['Result']['Read-Pyogrio'].append(result['elapsed_time'])
-            
-            # Measurement for DuckDB.
-            fmt = os.path.basename(file_data['file_path']).split('.')[1]
-            file_path = glob(os.path.join(dirname, f"*.{fmt}"))[0]
-            result = read_duckdb(**file_data)
-            pack[driver]['Result']['Read-DuckDB'].append(result['elapsed_time'])
-
-            # Measurement for QGIS.
-            result = read_file_by_qgis(**file_data)
-            pack[driver]['Result']['Read-QGIS'].append(result['elapsed_time'])
-            lyr = result['func_result']
-            result = measure_rendering_time(**file_data)
-            pack[driver]['Result']['Renderer-QGIS'].append(result['elapsed_time'])
-            QgsProject.instance().removeMapLayer(result['LyrID'])
-            if file_data['driver'] == 'GPKG':
-                file_data['layer'] += f'_{i}'
-            
-            result = write_file_by_qgis(lyr, **file_data)
-            pack[driver]['Result']['Write-QGIS'].append(result['elapsed_time'])
-            lyr = None
-            
-        print(f'Finish {driver}.')
-        
-    results[f"Processing time for {rows} rows"] = {driver: item['Result'] for driver, item in pack.items()}
-    del_dirs.append(dirname)
-
-
-colormap = {
-    "GeoJSON": "#0000cd",
-    "KML": "#006400",
-    "Esri Shapefile": "#ff8c00",
-    "FlatGeobuf": "#4d4398",
-    "GeoPackage": "#93b023",
-    "GeoParquet": "#d3381c",
+mearsurements = {
+    'Write-GeoPandas': [],
+    'Read-GeoPandas': [],
+    'Write-Pyogrio': [],
+    'Read-Pyogrio': [],
+    'Read-DuckDB': [],
+    'Write-QGIS': [],
+    'Read-QGIS': [],
+    'Renderer-QGIS': [],
 }
 
-with open(os.path.join(base_dirname, 'measurement.json'), mode='w') as f:
-    json.dump(results, f, indent=4)
+size = 5
+
+pack = {
+    'GeoJSON': {
+        'FilePaths': [
+            make_path(dirname, f'test_{i}.geojson', driver='GeoJSON') 
+            for i in range(size)
+        ],
+        'Result': copy.deepcopy(mearsurements)
+    },
+    'KML': {
+        'FilePaths': [
+            make_path(dirname, f'test_{i}.kml', driver='KML') 
+            for i in range(size)
+        ],
+        'Result': copy.deepcopy(mearsurements)
+    },
+    'Esri Shapefile': {
+        'FilePaths': [
+            make_path(dirname, f'test_{i}.shp', driver='Esri Shapefile') 
+            for i in range(size)
+        ],
+        'Result': copy.deepcopy(mearsurements)
+    },
+    'FlatGeobuf': {
+        'FilePaths': [
+            make_path(dirname, f'test_{i}.fgb', driver='FlatGeobuf') 
+            for i in range(size)
+        ],
+        'Result': copy.deepcopy(mearsurements)
+    },
+    'GeoParquet': {
+        'FilePaths': [
+            make_path(dirname, f'test_{i}.parquet', driver='Parquet') 
+            for i in range(size)
+        ],
+        'Result': copy.deepcopy(mearsurements)
+    },
+    'GeoPackage': {
+        'FilePaths': [
+            make_path(dirname, 'test.gpkg', driver='GPKG', layer=f'lyr_{i}') 
+            for i in range(size)
+        ],
+        'Result': copy.deepcopy(mearsurements)
+    },
+}
+
+small_pack = copy.deepcopy(pack)
+datasets = dummy_data(size=5_000)
+for name, items in pack.items():
+    for file_data in items['FilePaths']:
+        # Measurement for GeoPandas.
+        result = write_geopandas(datasets, **file_data)
+        small_pack[name]['Result']['Write-GeoPandas'].append(result['elapsed_time'])
+        result = read_geopandas(**file_data)
+        small_pack[name]['Result']['Read-GeoPandas'].append(result['elapsed_time'])
+        
+        # Measurement for Pyogrio.
+        result = write_pyogrio(datasets, **file_data)
+        small_pack[name]['Result']['Write-Pyogrio'].append(result['elapsed_time'])
+        result = read_pyogrio(**file_data)
+        small_pack[name]['Result']['Read-Pyogrio'].append(result['elapsed_time'])
+        
+        # Measurement for DuckDB.
+        fmt = os.path.basename(file_data['file_path']).split('.')[1]
+        file_path = glob(os.path.join(dirname, f"*.{fmt}"))[0]
+        result = read_duckdb(**file_data)
+        small_pack[name]['Result']['Read-DuckDB'].append(result['elapsed_time'])
+
+        # Measurement for QGIS.
+        result = read_file_by_qgis(**file_data)
+        small_pack[name]['Result']['Read-QGIS'].append(result['elapsed_time'])
+        result['func_result'] = None
+        result = measure_rendering_time(**file_data)
+        small_pack[name]['Result']['Renderer-QGIS'].append(result['elapsed_time'])
+        
+
+
+
+    print(f'{name} is done.')
+from pprint import pprint
+pprint(small_pack, indent=2)
